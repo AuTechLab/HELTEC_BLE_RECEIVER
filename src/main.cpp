@@ -1,23 +1,21 @@
 /**
  * BLE_Reciver  Heltec WiFi LoRa 32 V3
  *
- * Flow on each LoRa packet arrival:
- *   1. Read packet (interrupt-driven via DIO1)
- *   2. Send ACK back IMMEDIATELY (P2P link-health for sender)
- *   3. Parse JSON payload from sender
- *   4. Get NTP timestamp (ISO-8601 UTC)
- *   5. Publish one MQTT message per BLE device:
- *        topic : MQTT_TOPIC
- *        payload: {"ts":"...","mac":"xx:xx:xx:xx:xx:xx","rssi":-70,
- *                  "node":"S01","gw_rssi":-55.0,"gw_snr":9.2}
- *   6. Update OLED with live status
+ * RTOS Architecture  (LoRa independent from WiFi):
+ *   LoRa Task  (Core 0, prio 3): DIO1 ISR → readData → ACK → parse → xQueueSend
+ *   WiFi Task  (Core 1, prio 2): WiFiManager → NTP → MQTT → xQueueReceive → publish
+ *   loop()     (Core 1, prio 1): BOOT button only
+ *
+ * LoRa keeps receiving even while WiFi/MQTT is reconnecting.
+ * Parsed device payloads are held in a FreeRTOS queue (MQTT_QUEUE_SIZE items)
+ * and published as soon as the broker is reachable.
  *
  * OLED layout (SSD1306 128x64):
  *   == BLE Receiver ==
  *   LoRa: Listening #3
  *   Node: S01 -55dBm
  *   IP  : 192.168.x.x
- *   MQTT: OK 3/3pub
+ *   MQTT: OK +5
  *
  * LoRa pins (Heltec V3): NSS=8 DIO1=14 RST=12 BUSY=13
  * SPI pins             : SCK=9 MISO=11 MOSI=10
@@ -34,6 +32,10 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 // ==============================================
 //  User Configuration  <- Edit these
@@ -95,6 +97,19 @@ static const char ACK_PAYLOAD[] = "{\"ack\":1,\"gw\":\"R01\"}";
 #define BYTES_PER_DEV  7    // 6 MAC + 1 RSSI
 
 // ==============================================
+//  RTOS objects
+// ==============================================
+#define MQTT_QUEUE_SIZE  35   // max queued payloads
+
+struct MqttItem {
+    char     payload[256];
+    uint16_t len;
+};
+
+static QueueHandle_t     xMqttQueue    = nullptr;
+static SemaphoreHandle_t xDisplayMutex = nullptr;
+
+// ==============================================
 //  Hardware objects
 // ==============================================
 SX1262    radio   = new Module(SX_NSS, SX_DIO1, SX_RST, SX_BUSY);
@@ -132,6 +147,9 @@ static void initOledPowerAndReset() {
 }
 
 void oledUpdate() {
+    if (xDisplayMutex == nullptr) return;
+    if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
+
     char tmp[32];
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
@@ -155,6 +173,7 @@ void oledUpdate() {
     }
 
     display.sendBuffer();
+    xSemaphoreGive(xDisplayMutex);
 }
 
 // ==============================================
@@ -171,162 +190,12 @@ bool getNtpTimestamp(char* buf, size_t bufLen) {
 }
 
 // ==============================================
-//  WiFi (via WiFiManager)
-//  ครั้งแรก / หลังล้าง : เปิด AP "BLE-Receiver" → เชื่อม → เปิด 192.168.4.1
-//                        → กรอก SSID+Password → บันทึกลง flash
-//  บูตปกติ             : auto-connect ด้วย credentials ที่บันทึก
-//  ล้าง credentials     : กด BOOT (GPIO0) ค้าง ≥ 3 วิ ตอนเปิดเครื่อง
+//  LoRa helpers  (called ONLY from loraTask / Core 0)
+//  Never touch WiFi/MQTT from here — use queue instead.
 // ==============================================
-static void onConfigPortalStart(WiFiManager*) {
-    snprintf(sWiFi, sizeof(sWiFi), "AP:%s", WIFI_AP_NAME);
-    strncpy(sMQTT, "Open 192.168.4.1", sizeof(sMQTT));
-    oledUpdate();
-    Serial.println("[WiFi] Config portal open - connect to AP '" WIFI_AP_NAME "'");
-}
-
-bool connectWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return true;
-
-    strncpy(sWiFi, "WiFi reconnecting", sizeof(sWiFi));
-    oledUpdate();
-    WiFi.reconnect();
-
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - t0 > WIFI_TIMEOUT_MS) {
-            strncpy(sWiFi, "WiFi lost", sizeof(sWiFi));
-            oledUpdate();
-            Serial.println("[WiFi] Reconnect timeout");
-            return false;
-        }
-        delay(500);
-    }
-    String ip = WiFi.localIP().toString();
-    snprintf(sWiFi, sizeof(sWiFi), "IP:%s", ip.c_str());
-    Serial.printf("[WiFi] Reconnected - %s\n", ip.c_str());
-    oledUpdate();
-    return true;
-}
-
-// ==============================================
-//  MQTT - connect / reconnect
-// ==============================================
-bool connectMQTT() {
-    if (mqtt.connected()) return true;
-    if (!connectWiFi()) return false;
-
-    Serial.printf("[MQTT] Connecting to %s:%d ... ", MQTT_BROKER, MQTT_PORT);
-    const char* user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
-    const char* pass = strlen(MQTT_PASS) ? MQTT_PASS : nullptr;
-
-    bool ok = mqtt.connect(MQTT_CLIENT_ID, user, pass);
-    Serial.println(ok ? "OK" : "FAILED");
-    return ok;
-}
-
-// ==============================================
-//  Publish devices from decoded binary packet
-// ==============================================
-void publishBinaryDevices(const char* nodeId, uint8_t pktIdx, uint8_t totalPkt,
-                          const uint8_t* data, uint8_t cnt,
-                          float gwRssi, float gwSnr) {
-    char ts[24];
-    bool hasTime = getNtpTimestamp(ts, sizeof(ts));
-    if (!hasTime) strncpy(ts, "unknown", sizeof(ts));
-
-    int published = 0;
-    for (uint8_t i = 0; i < cnt; i++) {
-        const uint8_t* entry = data + i * BYTES_PER_DEV;
-        // Decode 6-byte binary MAC → string
-        char mac[18];
-        snprintf(mac, sizeof(mac),
-                 "%02x:%02x:%02x:%02x:%02x:%02x",
-                 entry[0], entry[1], entry[2],
-                 entry[3], entry[4], entry[5]);
-        int8_t rssi = (int8_t)entry[6];
-
-        StaticJsonDocument<256> pub;
-        pub["ts"]       = ts;
-        pub["mac"]      = mac;
-        pub["rssi"]     = rssi;
-       // pub["node"]     = nodeId;
-       // pub["gw_rssi"]  = gwRssi;
-       // pub["gw_snr"]   = gwSnr;
-       // pub["pkt"]      = pktIdx;    // packet index within burst
-       //pub["total_pkt"]= totalPkt;  // total packets in burst
-
-        char payload[256];
-        size_t len = serializeJson(pub, payload, sizeof(payload));
-
-        bool sent = false;
-        for (int attempt = 1; attempt <= MQTT_MAX_RETRIES && !sent; attempt++) {
-            mqtt.loop();
-            if (!connectMQTT()) {
-                snprintf(sMQTT, sizeof(sMQTT), "NoBroker %d/%d", attempt, MQTT_MAX_RETRIES);
-                oledUpdate();
-                delay(MQTT_RETRY_DELAY_MS);
-                continue;
-            }
-            sent = mqtt.publish(MQTT_TOPIC, payload, (unsigned int)len);
-            if (!sent) delay(MQTT_RETRY_DELAY_MS);
-        }
-        if (sent) {
-            published++;
-            Serial.printf("[MQTT] %s\n", payload);
-        } else {
-            Serial.printf("[MQTT] FAILED mac=%s\n", mac);
-        }
-    }
-
-    snprintf(sMQTT, sizeof(sMQTT), "p%d/%d %d/%dpub",
-             pktIdx + 1, totalPkt, published, cnt);
-    Serial.printf("[MQTT] Pkt %d/%d: %d/%d published\n",
-                  pktIdx + 1, totalPkt, published, cnt);
-    oledUpdate();
-}
-
-// ==============================================
-//  Initialisation
-// ==============================================
-void initOLED() {
-    initOledPowerAndReset();
-    display.begin();
-    display.setContrast(255);
-    display.clearBuffer();
-    display.setFont(u8g2_font_6x10_tf);
-    display.drawStr(0, 10, "=== BLE Receiver ===");
-    display.drawStr(0, 30, "Booting...");
-    display.sendBuffer();
-    delay(800);
-}
-
-void initLoRa() {
-    SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SX_NSS);
-    int16_t st = radio.begin(LORA_FREQUENCY, LORA_BW, LORA_SF, LORA_CR,
-                              RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
-                              LORA_TX_POWER, LORA_PREAMBLE);
-    if (st != RADIOLIB_ERR_NONE) {
-        snprintf(sLoRa, sizeof(sLoRa), "ERR %d", st);
-        oledUpdate();
-        Serial.printf("[LoRa] Init failed (err %d) - halting\n", st);
-        while (true) delay(1000);
-    }
-    radio.setDio2AsRfSwitch(true);
-    radio.setDio1Action(onRxDone);
-    radio.startReceive();
-    strncpy(sLoRa, "Listening", sizeof(sLoRa));
-    Serial.println("[LoRa] Listening");
-}
-
-// ==============================================
-//  Send ACK back to sender
-//  DIO1 interrupt is paused during TX to avoid spurious rxReady.
-//  radio.standby() ensures clean state before TX regardless of
-//  which mode readData() left the chip in.
-// ==============================================
-void sendAck() {
+static void sendAck() {
     radio.clearDio1Action();
-    radio.standby();                              // clean state before TX
+    radio.standby();
     int16_t st = radio.transmit((uint8_t*)ACK_PAYLOAD, strlen(ACK_PAYLOAD));
     if (st == RADIOLIB_ERR_NONE) {
         Serial.println("[ACK] Sent OK");
@@ -338,15 +207,30 @@ void sendAck() {
     radio.startReceive();
 }
 
-// ==============================================
-//  Process received LoRa packet (JSON or binary)
-// ==============================================
+// Encode one device entry as JSON and push to the MQTT queue.
+// Returns true if enqueued, false if skipped (WiFi offline) or queue full.
+static bool enqueueDevice(const char* ts, const char* mac, int8_t rssi) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[Queue] WiFi offline - skip %s\n", mac);
+        return false;
+    }
+    MqttItem item;
+    StaticJsonDocument<256> pub;
+    pub["ts"]   = ts;
+    pub["mac"]  = mac;
+    pub["rssi"] = rssi;
+    item.len = (uint16_t)serializeJson(pub, item.payload, sizeof(item.payload));
+    if (xQueueSend(xMqttQueue, &item, 0) != pdTRUE) {
+        Serial.println("[Queue] FULL - device dropped");
+        return false;
+    }
+    return true;
+}
+
 void handlePacket() {
-    // Read raw bytes (not String) to support binary payload
     uint8_t rawBuf[255];
-    size_t  rawLen = 0;
     int16_t st = radio.readData(rawBuf, sizeof(rawBuf));
-    rawLen = radio.getPacketLength();
+    size_t  rawLen = radio.getPacketLength();
 
     if (st == RADIOLIB_ERR_CRC_MISMATCH) {
         Serial.println("[RX] CRC mismatch - discarded");
@@ -369,17 +253,19 @@ void handlePacket() {
     Serial.printf("[RX] %u bytes | RSSI %.1f dBm | SNR %.1f dB\n",
                   (unsigned)rawLen, gwRssi, gwSnr);
 
+    char ts[24];
+    if (!getNtpTimestamp(ts, sizeof(ts))) strncpy(ts, "unknown", sizeof(ts));
+
     // ───────────────────────────────────────────────
     // Binary packet (magic byte 0xBE)
     // ───────────────────────────────────────────────
     if (rawLen >= (size_t)BIN_HEADER_LEN && rawBuf[0] == BIN_MAGIC) {
         uint8_t pktIdx   = rawBuf[1];
         uint8_t totalPkt = rawBuf[2];
-        // bytes 3-6: timestamp (ignored on receiver side)
-        uint8_t idLen = rawBuf[3]; if (idLen > 3) idLen = 3;
+        uint8_t idLen    = rawBuf[3]; if (idLen > 3) idLen = 3;
         char    nodeId[4] = {0};
         memcpy(nodeId, &rawBuf[4], idLen);
-        uint8_t cnt      = rawBuf[7];
+        uint8_t cnt = rawBuf[7];
 
         strncpy(sNode, nodeId, sizeof(sNode) - 1);
         sNode[sizeof(sNode) - 1] = '\0';
@@ -391,12 +277,21 @@ void handlePacket() {
                       pktIdx + 1, totalPkt, nodeId, cnt);
 
         if (cnt > 0 && rawLen >= (size_t)(BIN_HEADER_LEN + cnt * BYTES_PER_DEV)) {
-            publishBinaryDevices(nodeId, pktIdx, totalPkt,
-                                 &rawBuf[BIN_HEADER_LEN], cnt,
-                                 gwRssi, gwSnr);
+            int queued = 0;
+            for (uint8_t i = 0; i < cnt; i++) {
+                const uint8_t* e = &rawBuf[BIN_HEADER_LEN + i * BYTES_PER_DEV];
+                char mac[18];
+                snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         e[0], e[1], e[2], e[3], e[4], e[5]);
+                if (enqueueDevice(ts, mac, (int8_t)e[6])) queued++;
+            }
+            if (queued > 0) {
+                snprintf(sMQTT, sizeof(sMQTT), "Q+%d", queued);
+            } else {
+                strncpy(sMQTT, "NoWiFi", sizeof(sMQTT));
+            }
         } else {
             strncpy(sMQTT, "0 devices", sizeof(sMQTT));
-            oledUpdate();
         }
 
         strncpy(sLoRa, "Listening", sizeof(sLoRa));
@@ -428,37 +323,15 @@ void handlePacket() {
     strncpy(sNode, nodeId, sizeof(sNode) - 1);
     sNode[sizeof(sNode) - 1] = '\0';
 
-    JsonArrayConst devices = rxDoc["d"].as<JsonArrayConst>();
-    if (devices.size() > 0) {
-        // Re-use binary publisher with inline data
-        // (legacy path: publish directly)
-        char ts[24];
-        bool hasTime = getNtpTimestamp(ts, sizeof(ts));
-        if (!hasTime) strncpy(ts, "unknown", sizeof(ts));
-        int published = 0, total = (int)devices.size();
-        for (JsonObjectConst dev : devices) {
-            StaticJsonDocument<256> pub;
-            pub["ts"]      = ts;
-            pub["mac"]     = dev["m"] | "";
-            pub["rssi"]    = dev["r"] | 0;
-            pub["node"]    = nodeId;
-            pub["gw_rssi"] = gwRssi;
-            pub["gw_snr"]  = gwSnr;
-            char payload[256];
-            size_t len = serializeJson(pub, payload, sizeof(payload));
-            bool sent = false;
-            for (int attempt = 1; attempt <= MQTT_MAX_RETRIES && !sent; attempt++) {
-                mqtt.loop();
-                if (connectMQTT())
-                    sent = mqtt.publish(MQTT_TOPIC, payload, (unsigned int)len);
-                if (!sent) delay(MQTT_RETRY_DELAY_MS);
-            }
-            if (sent) published++;
-        }
-        snprintf(sMQTT, sizeof(sMQTT), "%s %d/%dpub",
-                 published == total ? "OK" : "PART", published, total);
+    int cnt = 0, queued = 0;
+    for (JsonObjectConst dev : rxDoc["d"].as<JsonArrayConst>()) {
+        if (enqueueDevice(ts, dev["m"] | "", dev["r"] | 0)) queued++;
+        cnt++;
+    }
+    if (queued > 0) {
+        snprintf(sMQTT, sizeof(sMQTT), "Q+%d", queued);
     } else {
-        strncpy(sMQTT, "0 devices", sizeof(sMQTT));
+        strncpy(sMQTT, cnt > 0 ? "NoWiFi" : "0 devices", sizeof(sMQTT));
     }
 
     strncpy(sLoRa, "Listening", sizeof(sLoRa));
@@ -466,20 +339,52 @@ void handlePacket() {
 }
 
 // ==============================================
-//  Arduino entry points
+//  LoRa Task  — Core 0, priority 3
+//  Owns: SPI bus, radio object, rxReady flag
 // ==============================================
-void setup() {
-    Serial.begin(115200);
-    delay(100);
-    Serial.println("\n=== LoRa P2P - BLE Receiver (MQTT) ===");
+static void loraTask(void* /*pvParameters*/) {
+    SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SX_NSS);
+    int16_t st = radio.begin(LORA_FREQUENCY, LORA_BW, LORA_SF, LORA_CR,
+                              RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
+                              LORA_TX_POWER, LORA_PREAMBLE);
+    if (st != RADIOLIB_ERR_NONE) {
+        snprintf(sLoRa, sizeof(sLoRa), "ERR %d", st);
+        oledUpdate();
+        Serial.printf("[LoRa] Init failed (err %d)\n", st);
+        vTaskDelete(nullptr);
+        return;
+    }
+    radio.setDio2AsRfSwitch(true);
+    radio.setDio1Action(onRxDone);
+    radio.startReceive();
+    strncpy(sLoRa, "Listening", sizeof(sLoRa));
+    Serial.println("[LoRa] Listening");
+    oledUpdate();
 
-    initOLED();
+    for (;;) {
+        if (rxReady) {
+            rxReady = false;
+            handlePacket();
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
 
-    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-    mqtt.setKeepAlive(60);
+// ==============================================
+//  WiFi / MQTT Task  — Core 1, priority 2
+//  Owns: WiFiManager, PubSubClient, NTP
+//  WiFiManager.autoConnect() is blocking — runs at task start only.
+//  After that, reconnects happen non-blocking with vTaskDelay().
+// ==============================================
+static void onConfigPortalStart(WiFiManager*) {
+    snprintf(sWiFi, sizeof(sWiFi), "AP:%s", WIFI_AP_NAME);
+    strncpy(sMQTT, "Open 192.168.4.1", sizeof(sMQTT));
+    oledUpdate();
+    Serial.println("[WiFi] Config portal open - connect to AP '" WIFI_AP_NAME "'");
+}
 
-    pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
-
+static void wifiMqttTask(void* /*pvParameters*/) {
+    // ── Initial WiFi connect via WiFiManager ──
     wifiManager.setConnectTimeout(20);
     wifiManager.setConfigPortalTimeout(180);
     wifiManager.setAPCallback(onConfigPortalStart);
@@ -490,30 +395,140 @@ void setup() {
         Serial.printf("[WiFi] Connected - %s\n", ip.c_str());
         strncpy(sMQTT, "---", sizeof(sMQTT));
         oledUpdate();
-        // Sync NTP
+
         configTime(NTP_TZ_OFFSET_S, NTP_DST_S, NTP_SERVER1, NTP_SERVER2);
         Serial.print("[NTP] Syncing");
         unsigned long t0 = millis();
         while (time(nullptr) < 1000000000UL && millis() - t0 < 10000) {
-            delay(500);
+            vTaskDelay(pdMS_TO_TICKS(500));
             Serial.print(".");
         }
         Serial.println(time(nullptr) >= 1000000000UL ? " OK" : " TIMEOUT");
-        connectMQTT();
     } else {
         strncpy(sWiFi, "WiFi FAILED", sizeof(sWiFi));
         Serial.println("[WiFi] Connect/portal failed");
         oledUpdate();
     }
 
-    initLoRa();
+    // ── Main loop ──
+    for (;;) {
+        // 1. Reconnect WiFi if lost (non-blocking with vTaskDelay — LoRa keeps running)
+        if (WiFi.status() != WL_CONNECTED) {
+            strncpy(sWiFi, "WiFi reconnecting", sizeof(sWiFi));
+            strncpy(sMQTT, "---", sizeof(sMQTT));
+            oledUpdate();
+            WiFi.reconnect();
+            unsigned long t0 = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                String ip = WiFi.localIP().toString();
+                snprintf(sWiFi, sizeof(sWiFi), "IP:%s", ip.c_str());
+                Serial.printf("[WiFi] Reconnected - %s\n", ip.c_str());
+                configTime(NTP_TZ_OFFSET_S, NTP_DST_S, NTP_SERVER1, NTP_SERVER2);
+                oledUpdate();
+            } else {
+                strncpy(sWiFi, "WiFi lost", sizeof(sWiFi));
+                oledUpdate();
+                vTaskDelay(pdMS_TO_TICKS(5000));  // back-off before next attempt
+                continue;
+            }
+        }
 
-    oledUpdate();
+        // 2. Reconnect MQTT if disconnected
+        if (!mqtt.connected()) {
+            Serial.printf("[MQTT] Connecting to %s:%d ...", MQTT_BROKER, MQTT_PORT);
+            const char* user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
+            const char* pass = strlen(MQTT_PASS) ? MQTT_PASS : nullptr;
+            bool ok = mqtt.connect(MQTT_CLIENT_ID, user, pass);
+            Serial.println(ok ? " OK" : " FAILED");
+            if (!ok) {
+                strncpy(sMQTT, "NoBroker", sizeof(sMQTT));
+                oledUpdate();
+                vTaskDelay(pdMS_TO_TICKS(MQTT_RETRY_DELAY_MS));
+                continue;
+            }
+        }
+
+        mqtt.loop();
+
+        // 3. Drain the MQTT queue — publish every queued device payload
+        MqttItem item;
+        int published = 0;
+        while (xQueueReceive(xMqttQueue, &item, 0) == pdTRUE) {
+            bool sent = false;
+            for (int attempt = 0; attempt < MQTT_MAX_RETRIES && !sent; attempt++) {
+                if (!mqtt.connected()) {
+                    mqtt.connect(MQTT_CLIENT_ID,
+                                 strlen(MQTT_USER) ? MQTT_USER : nullptr,
+                                 strlen(MQTT_PASS) ? MQTT_PASS : nullptr);
+                    if (!mqtt.connected()) {
+                        vTaskDelay(pdMS_TO_TICKS(MQTT_RETRY_DELAY_MS));
+                        continue;
+                    }
+                }
+                mqtt.loop();
+                sent = mqtt.publish(MQTT_TOPIC, item.payload, (unsigned int)item.len);
+                if (!sent) vTaskDelay(pdMS_TO_TICKS(MQTT_RETRY_DELAY_MS));
+            }
+            if (sent) {
+                published++;
+                Serial.printf("[MQTT] %s\n", item.payload);
+            } else {
+                Serial.println("[MQTT] FAILED - dropped");
+            }
+        }
+
+        if (published > 0) {
+            snprintf(sMQTT, sizeof(sMQTT), "OK +%d", published);
+            oledUpdate();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// ==============================================
+//  Initialisation helpers
+// ==============================================
+static void initOLED() {
+    initOledPowerAndReset();
+    display.begin();
+    display.setContrast(255);
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 10, "=== BLE Receiver ===");
+    display.drawStr(0, 30, "Booting...");
+    display.sendBuffer();
+    delay(800);
+}
+
+// ==============================================
+//  Arduino entry points
+// ==============================================
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("\n=== LoRa P2P - BLE Receiver (RTOS) ===");
+
+    initOLED();  // direct draw — tasks not started yet, no mutex needed
+
+    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    mqtt.setKeepAlive(60);
+    pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
+
+    // Create RTOS primitives before tasks start
+    xMqttQueue    = xQueueCreate(MQTT_QUEUE_SIZE, sizeof(MqttItem));
+    xDisplayMutex = xSemaphoreCreateMutex();
+
+    // LoRa Task : Core 0, prio 3  — receive → ACK → parse → enqueue
+    xTaskCreatePinnedToCore(loraTask,     "LoRaTask", 6144,  nullptr, 3, nullptr, 0);
+    // WiFi Task : Core 1, prio 2  — WiFiManager → NTP → MQTT → publish
+    xTaskCreatePinnedToCore(wifiMqttTask, "WiFiTask", 10240, nullptr, 2, nullptr, 1);
 }
 
 void loop() {
-    if (mqtt.connected()) mqtt.loop();
-
     // กด BOOT (GPIO0) ค้าง 3 วิ ตอนไหนก็ได้ = ล้าง WiFi credentials
     static unsigned long btnPressStart = 0;
     if (digitalRead(CONFIG_BTN_PIN) == LOW) {
@@ -530,9 +545,5 @@ void loop() {
     } else {
         btnPressStart = 0;
     }
-
-    if (rxReady) {
-        rxReady = false;
-        handlePacket();
-    }
+    delay(100);
 }
