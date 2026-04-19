@@ -31,14 +31,17 @@
 #include <RadioLib.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <time.h>
 
 // ==============================================
 //  User Configuration  <- Edit these
 // ==============================================
-#define WIFI_SSID        "AB"
-#define WIFI_PASSWORD    "1234567890"
+// --- WiFiManager: credentials saved to flash (no hardcoding needed) ---
+#define WIFI_AP_NAME     "BLE-Receiver"   // AP ที่เปิดตอนยังไม่มี credentials
+#define WIFI_AP_PASS     "12345678"        // รหัส AP config portal (min 8 ตัว)
+#define CONFIG_BTN_PIN   0                 // BOOT button: กด ค้าง 3 วิตอนเปิด = ล้าง WiFi
 
 // --- MQTT broker ---
 #define MQTT_BROKER      "139.180.132.158"
@@ -88,7 +91,7 @@ static const char ACK_PAYLOAD[] = "{\"ack\":1,\"gw\":\"R01\"}";
 
 // --- Binary packet format (must match sender) ---
 #define BIN_MAGIC      0xBE
-#define BIN_HEADER_LEN 12
+#define BIN_HEADER_LEN 8
 #define BYTES_PER_DEV  7    // 6 MAC + 1 RSSI
 
 // ==============================================
@@ -98,6 +101,7 @@ SX1262    radio   = new Module(SX_NSS, SX_DIO1, SX_RST, SX_BUSY);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
+WiFiManager  wifiManager;
 
 // --- RX interrupt flag ---
 volatile bool rxReady = false;
@@ -143,8 +147,12 @@ void oledUpdate() {
 
     display.drawStr(0, 48, sWiFi);
 
-    snprintf(tmp, sizeof(tmp), "MQTT: %s", sMQTT);
-    display.drawStr(0, 62, tmp);
+    if (strncmp(sMQTT, "Open", 4) == 0) {
+        display.drawStr(0, 62, sMQTT);
+    } else {
+        snprintf(tmp, sizeof(tmp), "MQTT: %s", sMQTT);
+        display.drawStr(0, 62, tmp);
+    }
 
     display.sendBuffer();
 }
@@ -163,33 +171,39 @@ bool getNtpTimestamp(char* buf, size_t bufLen) {
 }
 
 // ==============================================
-//  WiFi
+//  WiFi (via WiFiManager)
+//  ครั้งแรก / หลังล้าง : เปิด AP "BLE-Receiver" → เชื่อม → เปิด 192.168.4.1
+//                        → กรอก SSID+Password → บันทึกลง flash
+//  บูตปกติ             : auto-connect ด้วย credentials ที่บันทึก
+//  ล้าง credentials     : กด BOOT (GPIO0) ค้าง ≥ 3 วิ ตอนเปิดเครื่อง
 // ==============================================
+static void onConfigPortalStart(WiFiManager*) {
+    snprintf(sWiFi, sizeof(sWiFi), "AP:%s", WIFI_AP_NAME);
+    strncpy(sMQTT, "Open 192.168.4.1", sizeof(sMQTT));
+    oledUpdate();
+    Serial.println("[WiFi] Config portal open - connect to AP '" WIFI_AP_NAME "'");
+}
+
 bool connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return true;
 
-    strncpy(sWiFi, "WiFi connecting...", sizeof(sWiFi));
+    strncpy(sWiFi, "WiFi reconnecting", sizeof(sWiFi));
     oledUpdate();
-    Serial.printf("[WiFi] Connecting to '%s'", WIFI_SSID);
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.reconnect();
 
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - t0 > WIFI_TIMEOUT_MS) {
-            strncpy(sWiFi, "WiFi TIMEOUT", sizeof(sWiFi));
+            strncpy(sWiFi, "WiFi lost", sizeof(sWiFi));
             oledUpdate();
-            Serial.println("\n[WiFi] Timeout");
+            Serial.println("[WiFi] Reconnect timeout");
             return false;
         }
         delay(500);
-        Serial.print(".");
     }
     String ip = WiFi.localIP().toString();
     snprintf(sWiFi, sizeof(sWiFi), "IP:%s", ip.c_str());
-    Serial.printf("\n[WiFi] Connected - %s\n", ip.c_str());
+    Serial.printf("[WiFi] Reconnected - %s\n", ip.c_str());
     oledUpdate();
     return true;
 }
@@ -235,11 +249,11 @@ void publishBinaryDevices(const char* nodeId, uint8_t pktIdx, uint8_t totalPkt,
         pub["ts"]       = ts;
         pub["mac"]      = mac;
         pub["rssi"]     = rssi;
-        pub["node"]     = nodeId;
-        pub["gw_rssi"]  = gwRssi;
-        pub["gw_snr"]   = gwSnr;
+       // pub["node"]     = nodeId;
+       // pub["gw_rssi"]  = gwRssi;
+       // pub["gw_snr"]   = gwSnr;
        // pub["pkt"]      = pktIdx;    // packet index within burst
-        //pub["total_pkt"]= totalPkt;  // total packets in burst
+       //pub["total_pkt"]= totalPkt;  // total packets in burst
 
         char payload[256];
         size_t len = serializeJson(pub, payload, sizeof(payload));
@@ -362,10 +376,10 @@ void handlePacket() {
         uint8_t pktIdx   = rawBuf[1];
         uint8_t totalPkt = rawBuf[2];
         // bytes 3-6: timestamp (ignored on receiver side)
-        uint8_t idLen    = rawBuf[7]; if (idLen > 3) idLen = 3;
+        uint8_t idLen = rawBuf[3]; if (idLen > 3) idLen = 3;
         char    nodeId[4] = {0};
-        memcpy(nodeId, &rawBuf[8], idLen);
-        uint8_t cnt      = rawBuf[11];
+        memcpy(nodeId, &rawBuf[4], idLen);
+        uint8_t cnt      = rawBuf[7];
 
         strncpy(sNode, nodeId, sizeof(sNode) - 1);
         sNode[sizeof(sNode) - 1] = '\0';
@@ -460,12 +474,22 @@ void setup() {
     Serial.println("\n=== LoRa P2P - BLE Receiver (MQTT) ===");
 
     initOLED();
-    initLoRa();        
-    
+
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setKeepAlive(60);
 
-    if (connectWiFi()) {
+    pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
+
+    wifiManager.setConnectTimeout(20);
+    wifiManager.setConfigPortalTimeout(180);
+    wifiManager.setAPCallback(onConfigPortalStart);
+
+    if (wifiManager.autoConnect(WIFI_AP_NAME, WIFI_AP_PASS)) {
+        String ip = WiFi.localIP().toString();
+        snprintf(sWiFi, sizeof(sWiFi), "IP:%s", ip.c_str());
+        Serial.printf("[WiFi] Connected - %s\n", ip.c_str());
+        strncpy(sMQTT, "---", sizeof(sMQTT));
+        oledUpdate();
         // Sync NTP
         configTime(NTP_TZ_OFFSET_S, NTP_DST_S, NTP_SERVER1, NTP_SERVER2);
         Serial.print("[NTP] Syncing");
@@ -476,13 +500,36 @@ void setup() {
         }
         Serial.println(time(nullptr) >= 1000000000UL ? " OK" : " TIMEOUT");
         connectMQTT();
+    } else {
+        strncpy(sWiFi, "WiFi FAILED", sizeof(sWiFi));
+        Serial.println("[WiFi] Connect/portal failed");
+        oledUpdate();
     }
+
+    initLoRa();
 
     oledUpdate();
 }
 
 void loop() {
     if (mqtt.connected()) mqtt.loop();
+
+    // กด BOOT (GPIO0) ค้าง 3 วิ ตอนไหนก็ได้ = ล้าง WiFi credentials
+    static unsigned long btnPressStart = 0;
+    if (digitalRead(CONFIG_BTN_PIN) == LOW) {
+        if (btnPressStart == 0) btnPressStart = millis();
+        if (millis() - btnPressStart >= 3000) {
+            strncpy(sWiFi, "WiFi reset! Reboot", sizeof(sWiFi));
+            strncpy(sMQTT, "---", sizeof(sMQTT));
+            oledUpdate();
+            Serial.println("[WiFi] Credentials cleared - restarting");
+            wifiManager.resetSettings();
+            delay(500);
+            ESP.restart();
+        }
+    } else {
+        btnPressStart = 0;
+    }
 
     if (rxReady) {
         rxReady = false;
