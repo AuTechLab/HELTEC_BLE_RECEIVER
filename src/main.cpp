@@ -126,14 +126,14 @@ void oledUpdate() {
 
 // ==============================================
 //  NTP - get ISO-8601 UTC timestamp
-//  e.g.  "2026-04-18T10:30:00Z"
+//  e.g.  "2026-04-22 00:20:09"  (UTC+7 local time)
 // ==============================================
 bool getNtpTimestamp(char* buf, size_t bufLen) {
     time_t now = time(nullptr);
     if (now < 1000000000UL) return false;
-    struct tm utcTm;
-    gmtime_r(&now, &utcTm);
-    strftime(buf, bufLen, "%Y-%m-%dT%H:%M:%SZ", &utcTm);
+    struct tm localTm;
+    localtime_r(&now, &localTm);
+    strftime(buf, bufLen, "%Y-%m-%d %H:%M:%S", &localTm);
     return true;
 }
 
@@ -162,10 +162,18 @@ static bool enqueueDevice(const char* ts, const char* mac, int8_t rssi) {
         Serial.printf("[Queue] WiFi offline - skip %s\n", mac);
         return false;
     }
+    // Normalise MAC → uppercase, no separators (e.g. "76E1C36D275C")
+    char macNorm[13] = {0};
+    int j = 0;
+    for (int i = 0; mac[i] && j < 12; i++) {
+        if (mac[i] != ':' && mac[i] != '-') {
+            macNorm[j++] = (char)toupper((unsigned char)mac[i]);
+        }
+    }
     MqttItem item;
     StaticJsonDocument<256> pub;
     pub["ts"]   = ts;
-    pub["mac"]  = mac;
+    pub["mac"]  = macNorm;
     pub["rssi"] = rssi;
     item.len = (uint16_t)serializeJson(pub, item.payload, sizeof(item.payload));
     if (xQueueSend(xMqttQueue, &item, 0) != pdTRUE) {
@@ -228,8 +236,8 @@ void handlePacket() {
             int queued = 0;
             for (uint8_t i = 0; i < cnt; i++) {
                 const uint8_t* e = &rawBuf[BIN_HEADER_LEN + i * BYTES_PER_DEV];
-                char mac[18];
-                snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                char mac[13];
+                snprintf(mac, sizeof(mac), "%02X%02X%02X%02X%02X%02X",
                          e[0], e[1], e[2], e[3], e[4], e[5]);
                 if (enqueueDevice(ts, mac, (int8_t)e[6])) queued++;
             }
