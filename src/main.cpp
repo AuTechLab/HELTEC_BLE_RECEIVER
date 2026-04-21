@@ -3,8 +3,8 @@
  *
  * RTOS Architecture  (LoRa independent from WiFi):
  *   LoRa Task  (Core 0, prio 3): DIO1 ISR → readData → ACK → parse → xQueueSend
- *   WiFi Task  (Core 1, prio 2): WiFiManager → NTP → MQTT → xQueueReceive → publish
- *   loop()     (Core 1, prio 1): BOOT button only
+ *   WiFi Task  (Core 1, prio 2): WiFi.begin → NTP → MQTT → xQueueReceive → publish
+ *   loop()     (Core 1, prio 1): idle
  *
  * LoRa keeps receiving even while WiFi/MQTT is reconnecting.
  * Parsed device payloads are held in a FreeRTOS queue (MQTT_QUEUE_SIZE items)
@@ -29,64 +29,13 @@
 #include <RadioLib.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <PubSubClient.h>
+#include "config.h"
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
-
-// ==============================================
-//  User Configuration  <- Edit these
-// ==============================================
-// --- WiFiManager: credentials saved to flash (no hardcoding needed) ---
-#define WIFI_AP_NAME     "BLE-Receiver"   // AP ที่เปิดตอนยังไม่มี credentials
-#define WIFI_AP_PASS     "12345678"        // รหัส AP config portal (min 8 ตัว)
-#define CONFIG_BTN_PIN   0                 // BOOT button: กด ค้าง 3 วิตอนเปิด = ล้าง WiFi
-
-// --- MQTT broker ---
-#define MQTT_BROKER      "139.180.132.158"
-#define MQTT_PORT        1883
-#define MQTT_CLIENT_ID   "lora-receiver-R01"
-#define MQTT_TOPIC       "ble/scan"
-// Users: DNP0001-DNP0005  Pass: <user>@2o26 (o=lowercase o)
-#define MQTT_USER        "DNP0001"
-#define MQTT_PASS        "DNP0001@2o26"
-
-// --- NTP ---
-#define NTP_SERVER1      "pool.ntp.org"
-#define NTP_SERVER2      "time.google.com"
-#define NTP_TZ_OFFSET_S  (7 * 3600)   // UTC+7 (Bangkok)
-#define NTP_DST_S        0
-
-// --- LoRa parameters (must match sender) ---
-#define LORA_FREQUENCY   923.0f
-#define LORA_BW          125.0f
-#define LORA_SF          7
-#define LORA_CR          5
-#define LORA_TX_POWER    14
-#define LORA_PREAMBLE    8
-
-// --- Heltec V3 SX1262 pins ---
-#define SX_NSS   8
-#define SX_DIO1  14
-#define SX_RST   12
-#define SX_BUSY  13
-#define SPI_SCK  9
-#define SPI_MISO 11
-#define SPI_MOSI 10
-
-// --- Heltec V3 OLED (SSD1306 128x64 I2C) ---
-#define VEXT_CTRL 36
-#define OLED_RST 21
-#define OLED_SCL 18
-#define OLED_SDA 17
-
-// --- WiFi / MQTT retry ---
-#define WIFI_TIMEOUT_MS      15000
-#define MQTT_MAX_RETRIES     3
-#define MQTT_RETRY_DELAY_MS  2000
 
 // --- ACK sent back to sender ---
 static const char ACK_PAYLOAD[] = "{\"ack\":1,\"gw\":\"R01\"}";
@@ -116,7 +65,6 @@ SX1262    radio   = new Module(SX_NSS, SX_DIO1, SX_RST, SX_BUSY);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
-WiFiManager  wifiManager;
 
 // --- RX interrupt flag ---
 volatile bool rxReady = false;
@@ -376,20 +324,20 @@ static void loraTask(void* /*pvParameters*/) {
 //  WiFiManager.autoConnect() is blocking — runs at task start only.
 //  After that, reconnects happen non-blocking with vTaskDelay().
 // ==============================================
-static void onConfigPortalStart(WiFiManager*) {
-    snprintf(sWiFi, sizeof(sWiFi), "AP:%s", WIFI_AP_NAME);
-    strncpy(sMQTT, "Open 192.168.4.1", sizeof(sMQTT));
-    oledUpdate();
-    Serial.println("[WiFi] Config portal open - connect to AP '" WIFI_AP_NAME "'");
-}
-
 static void wifiMqttTask(void* /*pvParameters*/) {
-    // ── Initial WiFi connect via WiFiManager ──
-    wifiManager.setConnectTimeout(20);
-    wifiManager.setConfigPortalTimeout(180);
-    wifiManager.setAPCallback(onConfigPortalStart);
+    // ── Initial WiFi connect ──
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    snprintf(sWiFi, sizeof(sWiFi), "Connecting...");
+    oledUpdate();
+    Serial.print("[WiFi] Connecting");
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Serial.print(".");
+    }
+    Serial.println();
 
-    if (wifiManager.autoConnect(WIFI_AP_NAME, WIFI_AP_PASS)) {
+    if (WiFi.status() == WL_CONNECTED) {
         String ip = WiFi.localIP().toString();
         snprintf(sWiFi, sizeof(sWiFi), "IP:%s", ip.c_str());
         Serial.printf("[WiFi] Connected - %s\n", ip.c_str());
@@ -398,7 +346,7 @@ static void wifiMqttTask(void* /*pvParameters*/) {
 
         configTime(NTP_TZ_OFFSET_S, NTP_DST_S, NTP_SERVER1, NTP_SERVER2);
         Serial.print("[NTP] Syncing");
-        unsigned long t0 = millis();
+        t0 = millis();
         while (time(nullptr) < 1000000000UL && millis() - t0 < 10000) {
             vTaskDelay(pdMS_TO_TICKS(500));
             Serial.print(".");
@@ -406,7 +354,7 @@ static void wifiMqttTask(void* /*pvParameters*/) {
         Serial.println(time(nullptr) >= 1000000000UL ? " OK" : " TIMEOUT");
     } else {
         strncpy(sWiFi, "WiFi FAILED", sizeof(sWiFi));
-        Serial.println("[WiFi] Connect/portal failed");
+        Serial.println("[WiFi] Connect failed");
         oledUpdate();
     }
 
@@ -516,7 +464,6 @@ void setup() {
 
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setKeepAlive(60);
-    pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
 
     // Create RTOS primitives before tasks start
     xMqttQueue    = xQueueCreate(MQTT_QUEUE_SIZE, sizeof(MqttItem));
@@ -529,21 +476,5 @@ void setup() {
 }
 
 void loop() {
-    // กด BOOT (GPIO0) ค้าง 3 วิ ตอนไหนก็ได้ = ล้าง WiFi credentials
-    static unsigned long btnPressStart = 0;
-    if (digitalRead(CONFIG_BTN_PIN) == LOW) {
-        if (btnPressStart == 0) btnPressStart = millis();
-        if (millis() - btnPressStart >= 3000) {
-            strncpy(sWiFi, "WiFi reset! Reboot", sizeof(sWiFi));
-            strncpy(sMQTT, "---", sizeof(sMQTT));
-            oledUpdate();
-            Serial.println("[WiFi] Credentials cleared - restarting");
-            wifiManager.resetSettings();
-            delay(500);
-            ESP.restart();
-        }
-    } else {
-        btnPressStart = 0;
-    }
-    delay(100);
+    delay(1000);
 }
