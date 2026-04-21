@@ -26,7 +26,7 @@
 // --- LoRa parameters (must match sender) ---
 #define LORA_FREQUENCY   923.0f
 #define LORA_BW          125.0f
-#define LORA_SF          7
+#define LORA_SF          12
 #define LORA_CR          5
 #define LORA_TX_POWER    22   // SX1262 max = 22 dBm  (AS923 legal limit ~27 dBm EIRP)
 #define LORA_PREAMBLE    8
