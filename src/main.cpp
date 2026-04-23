@@ -42,7 +42,8 @@ static const char ACK_PAYLOAD[] = "{\"ack\":1,\"gw\":\"R01\"}";
 
 // --- Binary packet format (must match sender) ---
 #define BIN_MAGIC      0xBE
-#define BIN_HEADER_LEN 8
+#define BIN_HEADER_LEN 10
+#define DEVS_PER_PKT   35
 #define BYTES_PER_DEV  7    // 6 MAC + 1 RSSI
 
 // ==============================================
@@ -157,7 +158,8 @@ static void sendAck() {
 
 // Encode one device entry as JSON and push to the MQTT queue.
 // Returns true if enqueued, false if skipped (WiFi offline) or queue full.
-static bool enqueueDevice(const char* ts, const char* mac, int8_t rssi) {
+static bool enqueueDevice(const char* ts, const char* mac, int8_t rssi,
+                          uint16_t globalIndex, uint16_t totalDevices) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.printf("[Queue] WiFi offline - skip %s\n", mac);
         return false;
@@ -170,11 +172,14 @@ static bool enqueueDevice(const char* ts, const char* mac, int8_t rssi) {
             macNorm[j++] = (char)toupper((unsigned char)mac[i]);
         }
     }
+    char noStr[12];
+    snprintf(noStr, sizeof(noStr), "%u/%u", globalIndex, totalDevices);
     MqttItem item;
     StaticJsonDocument<256> pub;
     pub["ts"]   = ts;
     pub["mac"]  = macNorm;
     pub["rssi"] = rssi;
+    pub["no"]   = noStr;
     item.len = (uint16_t)serializeJson(pub, item.payload, sizeof(item.payload));
     if (xQueueSend(xMqttQueue, &item, 0) != pdTRUE) {
         Serial.println("[Queue] FULL - device dropped");
@@ -216,12 +221,13 @@ void handlePacket() {
     // Binary packet (magic byte 0xBE)
     // ───────────────────────────────────────────────
     if (rawLen >= (size_t)BIN_HEADER_LEN && rawBuf[0] == BIN_MAGIC) {
-        uint8_t pktIdx   = rawBuf[1];
-        uint8_t totalPkt = rawBuf[2];
-        uint8_t idLen    = rawBuf[3]; if (idLen > 3) idLen = 3;
-        char    nodeId[4] = {0};
+        uint8_t  pktIdx      = rawBuf[1];
+        uint8_t  totalPkt    = rawBuf[2];
+        uint8_t  idLen       = rawBuf[3]; if (idLen > 3) idLen = 3;
+        char     nodeId[4]   = {0};
         memcpy(nodeId, &rawBuf[4], idLen);
-        uint8_t cnt = rawBuf[7];
+        uint8_t  cnt         = rawBuf[7];
+        uint16_t totalDevices = (uint16_t)rawBuf[8] | ((uint16_t)rawBuf[9] << 8);
 
         strncpy(sNode, nodeId, sizeof(sNode) - 1);
         sNode[sizeof(sNode) - 1] = '\0';
@@ -229,8 +235,8 @@ void handlePacket() {
         snprintf(sLoRa, sizeof(sLoRa), "RX %d/%d", pktIdx + 1, totalPkt);
         oledUpdate();
 
-        Serial.printf("[RX] Binary pkt %d/%d | node=%s | %d devs\n",
-                      pktIdx + 1, totalPkt, nodeId, cnt);
+        Serial.printf("[RX] Binary pkt %d/%d | node=%s | %d devs | total=%u\n",
+                      pktIdx + 1, totalPkt, nodeId, cnt, totalDevices);
 
         if (cnt > 0 && rawLen >= (size_t)(BIN_HEADER_LEN + cnt * BYTES_PER_DEV)) {
             int queued = 0;
@@ -239,7 +245,8 @@ void handlePacket() {
                 char mac[13];
                 snprintf(mac, sizeof(mac), "%02X%02X%02X%02X%02X%02X",
                          e[0], e[1], e[2], e[3], e[4], e[5]);
-                if (enqueueDevice(ts, mac, (int8_t)e[6])) queued++;
+                uint16_t globalIndex = (uint16_t)pktIdx * DEVS_PER_PKT + i + 1;
+                if (enqueueDevice(ts, mac, (int8_t)e[6], globalIndex, totalDevices)) queued++;
             }
             if (queued > 0) {
                 snprintf(sMQTT, sizeof(sMQTT), "Q+%d", queued);
@@ -281,7 +288,7 @@ void handlePacket() {
 
     int cnt = 0, queued = 0;
     for (JsonObjectConst dev : rxDoc["d"].as<JsonArrayConst>()) {
-        if (enqueueDevice(ts, dev["m"] | "", dev["r"] | 0)) queued++;
+        if (enqueueDevice(ts, dev["m"] | "", dev["r"] | 0, 0, 0)) queued++;
         cnt++;
     }
     if (queued > 0) {

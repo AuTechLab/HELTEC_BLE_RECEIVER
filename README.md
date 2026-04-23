@@ -78,8 +78,15 @@ MQTT: OK +5
 | Byte | ความหมาย |
 |---|---|
 | 0 | Magic byte `0xBE` |
-| 1–7 | Header (8 bytes รวม magic) |
-| ต่อไป | Device entries: 6 bytes MAC + 1 byte RSSI (ซ้ำ N ครั้ง) |
+| 1 | Packet index (0-based, uint8) |
+| 2 | Total packets in burst (uint8) |
+| 3 | NODE_ID length |
+| 4–6 | NODE_ID (3 bytes) |
+| 7 | Device count in this packet (uint8) |
+| 8–9 | Total devices in scan cycle (uint16, little-endian) |
+| 10+ | Device entries: 6 bytes MAC + 1 byte RSSI (ซ้ำ N ครั้ง) |
+
+`DEVS_PER_PKT = 35` (จำนวน device สูงสุดต่อ packet)
 
 เมื่อรับ packet ได้สำเร็จ บอร์ดจะส่ง ACK กลับ:
 ```json
@@ -99,11 +106,15 @@ MQTT: OK +5
 Payload ที่ publish (JSON):
 ```json
 {
-  "ts": "2026-04-20T10:30:00Z",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "rssi": -72
+  "ts": "2026-04-23 10:30:00",
+  "mac": "AABBCCDDEEFF",
+  "rssi": -72,
+  "no": "36/70"
 }
 ```
+
+- **`no`** — ลำดับ device แบบ 1-based ต่อเนื่องข้ามทุก packet / จำนวน device ทั้งหมดใน scan cycle
+  - คำนวณจาก: `(pkt_index × 35) + local_index + 1`
 
 ---
 
