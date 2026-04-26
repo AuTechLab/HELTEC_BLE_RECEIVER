@@ -5,8 +5,8 @@
 // ==============================================
 
 // --- WiFi ---
-#define WIFI_SSID        "AB"        // ชื่อ WiFi ที่ต้องการเชื่อมต่อ
-#define WIFI_PASS        "1234567890"    // รหัสผ่าน WiFi
+#define WIFI_SSID        "SSID"        // ชื่อ WiFi ที่ต้องการเชื่อมต่อ
+#define WIFI_PASS        "PASSWORD"    // รหัสผ่าน WiFi
 
 // --- MQTT broker ---
 #define MQTT_BROKER      "139.180.132.158"
