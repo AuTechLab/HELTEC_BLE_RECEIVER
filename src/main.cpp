@@ -245,7 +245,10 @@ void handlePacket() {
                 char mac[13];
                 snprintf(mac, sizeof(mac), "%02X%02X%02X%02X%02X%02X",
                          e[0], e[1], e[2], e[3], e[4], e[5]);
-                uint16_t globalIndex = (uint16_t)pktIdx * DEVS_PER_PKT + i + 1;
+                // totalDevices == 0 means sender found no BLE devices (sent own MAC)
+                // → publish no:"0/0" instead of no:"1/0"
+                uint16_t globalIndex = (totalDevices == 0) ? 0
+                                       : (uint16_t)pktIdx * DEVS_PER_PKT + i + 1;
                 if (enqueueDevice(ts, mac, (int8_t)e[6], globalIndex, totalDevices)) queued++;
             }
             if (queued > 0) {
